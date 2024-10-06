@@ -8,6 +8,8 @@ import shutil
 import sys
 import time
 import uuid
+import asyncio
+
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -19,7 +21,9 @@ from open_webui.apps.audio.main import app as audio_app
 from open_webui.apps.images.main import app as images_app
 from open_webui.apps.ollama.main import app as ollama_app
 from open_webui.apps.ollama.main import (
-    generate_openai_chat_completion as generate_ollama_chat_completion,
+    GenerateChatCompletionForm,
+    generate_chat_completion as generate_ollama_chat_completion,
+    generate_openai_chat_completion as generate_ollama_openai_chat_completion,
 )
 from open_webui.apps.ollama.main import get_all_models as get_ollama_models
 from open_webui.apps.openai.main import app as openai_app
@@ -29,7 +33,7 @@ from open_webui.apps.openai.main import (
 from open_webui.apps.openai.main import get_all_models as get_openai_models
 from open_webui.apps.rag.main import app as rag_app
 from open_webui.apps.rag.utils import get_rag_context, rag_template
-from open_webui.apps.socket.main import app as socket_app
+from open_webui.apps.socket.main import app as socket_app, periodic_usage_pool_cleanup
 from open_webui.apps.socket.main import get_event_call, get_event_emitter
 from open_webui.apps.webui.internal.db import Session
 from open_webui.apps.webui.main import app as webui_app
@@ -75,6 +79,7 @@ from open_webui.config import (
     WEBUI_NAME,
     AppConfig,
     run_migrations,
+    reset_config,
 )
 from open_webui.constants import ERROR_MESSAGES, TASKS, WEBHOOK_MESSAGES
 from open_webui.env import (
@@ -88,6 +93,7 @@ from open_webui.env import (
     WEBUI_SESSION_COOKIE_SAME_SITE,
     WEBUI_SESSION_COOKIE_SECURE,
     WEBUI_URL,
+    RESET_CONFIG_ON_START,
 )
 from fastapi import (
     Depends,
@@ -135,6 +141,12 @@ from open_webui.utils.utils import (
 )
 from open_webui.utils.webhook import post_webhook
 
+from open_webui.utils.payload import convert_payload_openai_to_ollama
+from open_webui.utils.response import (
+    convert_response_ollama_to_openai,
+    convert_streaming_response_ollama_to_openai,
+)
+
 if SAFE_MODE:
     print("SAFE MODE ENABLED")
     Functions.deactivate_all_functions()
@@ -176,6 +188,11 @@ https://github.com/open-webui/open-webui
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_migrations()
+
+    if RESET_CONFIG_ON_START:
+        reset_config()
+
+    asyncio.create_task(periodic_usage_pool_cleanup())
     yield
 
 
@@ -843,7 +860,6 @@ async def inspect_websocket(request: Request, call_next):
 
 
 app.mount("/ws", socket_app)
-
 app.mount("/ollama", ollama_app)
 app.mount("/openai", openai_app)
 
@@ -1048,7 +1064,18 @@ async def generate_chat_completions(form_data: dict, user=Depends(get_verified_u
     if model.get("pipe"):
         return await generate_function_chat_completion(form_data, user=user)
     if model["owned_by"] == "ollama":
-        return await generate_ollama_chat_completion(form_data, user=user)
+        # Using /ollama/api/chat endpoint
+        form_data = convert_payload_openai_to_ollama(form_data)
+        form_data = GenerateChatCompletionForm(**form_data)
+        response = await generate_ollama_chat_completion(form_data=form_data, user=user)
+        if form_data.stream:
+            response.headers["content-type"] = "text/event-stream"
+            return StreamingResponse(
+                convert_streaming_response_ollama_to_openai(response),
+                headers=dict(response.headers),
+            )
+        else:
+            return convert_response_ollama_to_openai(response)
     else:
         return await generate_openai_chat_completion(form_data, user=user)
 
@@ -1399,8 +1426,9 @@ async def generate_title(form_data: dict, user=Depends(get_verified_user)):
     # Check if the user has a custom task model
     # If the user has a custom task model, use that model
     task_model_id = get_task_model_id(model_id)
-
     print(task_model_id)
+
+    model = app.state.MODELS[task_model_id]
 
     if app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE != "":
         template = app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE
@@ -1440,9 +1468,9 @@ Prompt: {{prompt:middletruncate:8000}}"""
         "chat_id": form_data.get("chat_id", None),
         "metadata": {"task": str(TASKS.TITLE_GENERATION)},
     }
-
     log.debug(payload)
 
+    # Handle pipeline filters
     try:
         payload = filter_pipeline(payload, user)
     except Exception as e:
@@ -1456,7 +1484,6 @@ Prompt: {{prompt:middletruncate:8000}}"""
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={"detail": str(e)},
             )
-
     if "chat_id" in payload:
         del payload["chat_id"]
 
@@ -1483,6 +1510,8 @@ async def generate_search_query(form_data: dict, user=Depends(get_verified_user)
     # If the user has a custom task model, use that model
     task_model_id = get_task_model_id(model_id)
     print(task_model_id)
+
+    model = app.state.MODELS[task_model_id]
 
     if app.state.config.SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE != "":
         template = app.state.config.SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE
@@ -1516,9 +1545,9 @@ Search Query:"""
         ),
         "metadata": {"task": str(TASKS.QUERY_GENERATION)},
     }
+    log.debug(payload)
 
-    print(payload)
-
+    # Handle pipeline filters
     try:
         payload = filter_pipeline(payload, user)
     except Exception as e:
@@ -1532,7 +1561,6 @@ Search Query:"""
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={"detail": str(e)},
             )
-
     if "chat_id" in payload:
         del payload["chat_id"]
 
@@ -1555,12 +1583,13 @@ async def generate_emoji(form_data: dict, user=Depends(get_verified_user)):
     task_model_id = get_task_model_id(model_id)
     print(task_model_id)
 
+    model = app.state.MODELS[task_model_id]
+
     template = '''
 Your task is to reflect the speaker's likely facial expression through a fitting emoji. Interpret emotions from the message and reflect their facial expression using fitting, diverse emojis (e.g., 😊, 😢, 😡, 😱).
 
 Message: """{{prompt}}"""
 '''
-
     content = title_generation_template(
         template,
         form_data["prompt"],
@@ -1584,9 +1613,9 @@ Message: """{{prompt}}"""
         "chat_id": form_data.get("chat_id", None),
         "metadata": {"task": str(TASKS.EMOJI_GENERATION)},
     }
-
     log.debug(payload)
 
+    # Handle pipeline filters
     try:
         payload = filter_pipeline(payload, user)
     except Exception as e:
@@ -1600,7 +1629,6 @@ Message: """{{prompt}}"""
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={"detail": str(e)},
             )
-
     if "chat_id" in payload:
         del payload["chat_id"]
 
@@ -1620,8 +1648,10 @@ async def generate_moa_response(form_data: dict, user=Depends(get_verified_user)
 
     # Check if the user has a custom task model
     # If the user has a custom task model, use that model
-    model_id = get_task_model_id(model_id)
-    print(model_id)
+    task_model_id = get_task_model_id(model_id)
+    print(task_model_id)
+
+    model = app.state.MODELS[task_model_id]
 
     template = """You have been provided with a set of responses from various models to the latest user query: "{{prompt}}"
 
@@ -1636,13 +1666,12 @@ Responses from models: {{responses}}"""
     )
 
     payload = {
-        "model": model_id,
+        "model": task_model_id,
         "messages": [{"role": "user", "content": content}],
         "stream": form_data.get("stream", False),
         "chat_id": form_data.get("chat_id", None),
         "metadata": {"task": str(TASKS.MOA_RESPONSE_GENERATION)},
     }
-
     log.debug(payload)
 
     try:
@@ -1658,7 +1687,6 @@ Responses from models: {{responses}}"""
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={"detail": str(e)},
             )
-
     if "chat_id" in payload:
         del payload["chat_id"]
 
@@ -2309,10 +2337,11 @@ async def get_manifest_json():
     return {
         "name": WEBUI_NAME,
         "short_name": WEBUI_NAME,
+        "description": "Open WebUI is an open, extensible, user-friendly interface for AI that adapts to your workflow.",
         "start_url": "/",
         "display": "standalone",
         "background_color": "#343541",
-        "orientation": "portrait-primary",
+        "orientation": "any",
         "icons": [
             {
                 "src": "/static/logo.png",
